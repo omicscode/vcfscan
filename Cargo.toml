@@ -1,0 +1,15 @@
+[package]
+name = "vcfscan"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Gaurav Sablok <codeprog@icloud.com>"]
+description = "vcf visualizer"
+homepage = "https://github.com/omicscode/vcfscan"
+repository = "https://github.com/omicscode/vcfscan"
+
+[dependencies]
+ratatui = "0.28"
+crossterm = "0.27"
+walkdir = "2"
+regex = "1"
