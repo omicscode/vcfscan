@@ -1,17 +1,15 @@
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{self, EnableMouseCapture, Event, KeyCode},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{EnterAlternateScreen, enable_raw_mode},
 };
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Margin},
+    layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{
-        Block, Borders, Clear, List, ListItem, ListState, Paragraph, StatefulWidget, Tabs, Widget,
-    },
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs},
 };
 use std::{
     fs::File,
@@ -66,6 +64,7 @@ struct VcfState {
     chrom_filter: String,
     ref_filter: String,
     alt_filter: String,
+    pos_filter: String, // e.g. "1000-5000" or "12345"
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,13 +73,14 @@ enum ModalKind {
     Chrom,
     Ref,
     Alt,
+    Pos,
 }
 
 #[derive(Default)]
 struct ModalState {
     kind: ModalKind,
     input: String,
-    menu_selected: usize, // for the filter-menu list
+    menu_selected: usize,
 }
 
 impl Default for ModalKind {
@@ -106,9 +106,6 @@ impl ModalState {
     }
 }
 
-/// ---------------------------------------------------------------------------
-///  Helper functions
-/// ---------------------------------------------------------------------------
 fn parse_vcf(path: &Path) -> Result<Vec<VcfRecord>, Box<dyn std::error::Error>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
@@ -166,6 +163,8 @@ impl App {
     }
 
     fn filtered_records(&self) -> Vec<&VcfRecord> {
+        let pos_range = parse_pos_range(&self.vcf.pos_filter);
+
         self.vcf
             .records
             .iter()
@@ -182,10 +181,53 @@ impl App {
                     || r.alt
                         .to_lowercase()
                         .contains(&self.vcf.alt_filter.to_lowercase());
-                chrom && ref_ && alt
+
+                let pos_ok = match pos_range {
+                    PosRange::None => true,
+                    PosRange::Exact(pos) => r.pos == pos.to_string(),
+                    PosRange::Range(start, end) => {
+                        if let Ok(p) = r.pos.parse::<u64>() {
+                            p >= start && p <= end
+                        } else {
+                            false
+                        }
+                    }
+                };
+
+                chrom && ref_ && alt && pos_ok
             })
             .collect()
     }
+}
+
+#[derive(Debug)]
+enum PosRange {
+    None,
+    Exact(u64),
+    Range(u64, u64),
+}
+
+fn parse_pos_range(input: &str) -> PosRange {
+    let s = input.trim();
+    if s.is_empty() {
+        return PosRange::None;
+    }
+
+    if let Ok(pos) = s.parse::<u64>() {
+        return PosRange::Exact(pos);
+    }
+
+    if let Some((start_str, end_str)) = s.split_once('-') {
+        let start = start_str.trim().parse::<u64>();
+        let end = end_str.trim().parse::<u64>();
+        if let (Ok(start), Ok(end)) = (start, end) {
+            if start <= end {
+                return PosRange::Range(start, end);
+            }
+        }
+    }
+
+    PosRange::None
 }
 
 fn ui(f: &mut ratatui::Frame, app: &mut App) {
@@ -194,7 +236,6 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         .constraints([Constraint::Length(3), Constraint::Min(0)].as_ref())
         .split(f.area());
 
-    // ---- Tabs --------------------------------------------------------------
     let titles: Vec<_> = app.tabs.titles.iter().cloned().map(Line::from).collect();
     let tabs = Tabs::new(titles)
         .block(Block::default().borders(Borders::ALL).title("VCF TUI"))
@@ -207,14 +248,12 @@ fn ui(f: &mut ratatui::Frame, app: &mut App) {
         );
     f.render_widget(tabs, chunks[0]);
 
-    // ---- Content -----------------------------------------------------------
     match app.tabs.index {
         0 => render_file_tab(f, app, chunks[1]),
         1 => render_vcf_tab(f, app, chunks[1]),
         _ => {}
     }
 
-    // ---- Modal (on top of everything) --------------------------------------
     if let Some(modal) = &app.modal {
         render_modal(f, modal, app);
     }
@@ -272,10 +311,10 @@ fn render_vcf_tab(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)].as_ref())
         .split(area);
 
-    // ---- Filter summary ----------------------------------------------------
     let filter_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
             Constraint::Length(3),
@@ -297,6 +336,11 @@ fn render_vcf_tab(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect
         .block(Block::default().borders(Borders::ALL))
         .style(Style::default().fg(Color::Green));
     f.render_widget(alt, filter_chunks[2]);
+
+    let pos = Paragraph::new(format!("POS: {}", app.vcf.pos_filter))
+        .block(Block::default().borders(Borders::ALL))
+        .style(Style::default().fg(Color::Green));
+    f.render_widget(pos, filter_chunks[3]);
 
     let filtered = app.filtered_records();
     let mut list_state = ListState::default();
@@ -322,21 +366,20 @@ fn render_vcf_tab(f: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Variants (Up/Down navigate, f = filter menu)"),
+                .title("Variants (Up/Down, f = filter menu)"),
         )
         .highlight_style(Style::default().bg(Color::DarkGray));
 
     f.render_stateful_widget(list, chunks[1], &mut list_state);
 }
 
-/// Modal rendering -----------------------------------------------------------
-fn render_modal(f: &mut ratatui::Frame, modal: &ModalState, app: &App) {
+fn render_modal(f: &mut ratatui::Frame, modal: &ModalState, _app: &App) {
     let area = centered_rect(60, 30, f.area());
-    f.render_widget(Clear, area); // clear background
+    f.render_widget(Clear, area);
 
     match modal.kind {
         ModalKind::Menu => {
-            let items = vec!["CHROM", "REF", "ALT", "Clear all", "Cancel"];
+            let items = vec!["CHROM", "REF", "ALT", "POS", "Clear all", "Cancel"];
             let list_items: Vec<ListItem> = items
                 .iter()
                 .enumerate()
@@ -364,11 +407,12 @@ fn render_modal(f: &mut ratatui::Frame, modal: &ModalState, app: &App) {
             state.select(Some(modal.menu_selected));
             f.render_stateful_widget(list, area, &mut state);
         }
-        ModalKind::Chrom | ModalKind::Ref | ModalKind::Alt => {
+        ModalKind::Chrom | ModalKind::Ref | ModalKind::Alt | ModalKind::Pos => {
             let title = match modal.kind {
                 ModalKind::Chrom => "CHROM filter (Esc cancel, Enter accept)",
                 ModalKind::Ref => "REF filter (Esc cancel, Enter accept)",
                 ModalKind::Alt => "ALT filter (Esc cancel, Enter accept)",
+                ModalKind::Pos => "POS filter: 12345 or 1000-5000 (Esc cancel, Enter accept)",
                 _ => unreachable!(),
             };
             let input = Paragraph::new(modal.input.as_str())
@@ -403,9 +447,6 @@ fn centered_rect(
         .split(popup_layout[1])[1]
 }
 
-/// ---------------------------------------------------------------------------
-///  Event handling
-/// ---------------------------------------------------------------------------
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -414,13 +455,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new();
-    app.files.selected = app
-        .files
-        .items
-        .is_empty()
-        .then(|| None)
-        .or(Some(Some(0)))
-        .expect("file not found");
+    app.files.selected = if app.files.items.is_empty() {
+        None
+    } else {
+        Some(0)
+    };
     if app.files.selected.is_some() {
         app.load_selected_vcf();
     }
@@ -429,13 +468,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         terminal.draw(|f| ui(f, &mut app))?;
 
         if let Event::Key(key) = event::read()? {
-            // ------------------------------------------------- modal handling
             if app.modal.is_some() {
                 handle_modal_key(&mut app, key);
                 continue;
             }
 
-            // ------------------------------------------------- normal handling
             match app.tabs.index {
                 0 => handle_files_tab(&mut app, key),
                 1 => handle_vcf_tab(&mut app, key),
@@ -443,16 +480,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-
-    Ok(())
 }
 
 fn handle_files_tab(app: &mut App, key: crossterm::event::KeyEvent) {
@@ -532,7 +559,7 @@ fn handle_modal_key(app: &mut App, key: crossterm::event::KeyEvent) {
                 }
             }
             KeyCode::Down => {
-                if modal.menu_selected < 4 {
+                if modal.menu_selected < 5 {
                     modal.menu_selected += 1;
                 }
             }
@@ -540,23 +567,21 @@ fn handle_modal_key(app: &mut App, key: crossterm::event::KeyEvent) {
                 0 => app.modal = Some(ModalState::new_input(ModalKind::Chrom)),
                 1 => app.modal = Some(ModalState::new_input(ModalKind::Ref)),
                 2 => app.modal = Some(ModalState::new_input(ModalKind::Alt)),
-                3 => {
-                    // Clear all
+                3 => app.modal = Some(ModalState::new_input(ModalKind::Pos)),
+                4 => {
                     app.vcf.chrom_filter.clear();
                     app.vcf.ref_filter.clear();
                     app.vcf.alt_filter.clear();
+                    app.vcf.pos_filter.clear();
                     app.modal = None;
                 }
-                4 => {
-                    // Cancel
-                    app.modal = None;
-                }
+                5 => app.modal = None,
                 _ => {}
             },
             KeyCode::Esc => app.modal = None,
             _ => {}
         },
-        ModalKind::Chrom | ModalKind::Ref | ModalKind::Alt => match key.code {
+        ModalKind::Chrom | ModalKind::Ref | ModalKind::Alt | ModalKind::Pos => match key.code {
             KeyCode::Char(c) => {
                 modal.input.push(c);
             }
@@ -564,19 +589,17 @@ fn handle_modal_key(app: &mut App, key: crossterm::event::KeyEvent) {
                 modal.input.pop();
             }
             KeyCode::Enter => {
-                // Apply the filter
                 let txt = modal.input.trim().to_string();
                 match modal.kind {
                     ModalKind::Chrom => app.vcf.chrom_filter = txt,
                     ModalKind::Ref => app.vcf.ref_filter = txt,
                     ModalKind::Alt => app.vcf.alt_filter = txt,
+                    ModalKind::Pos => app.vcf.pos_filter = txt,
                     _ => {}
                 }
                 app.modal = None;
             }
-            KeyCode::Esc => {
-                app.modal = None;
-            }
+            KeyCode::Esc => app.modal = None,
             _ => {}
         },
     }
